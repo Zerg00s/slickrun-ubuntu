@@ -66,6 +66,15 @@ impl MagicWord {
         }
     }
 
+    /// Check if this magic word uses $W$ substitution.
+    pub fn needs_w_input(&self) -> bool {
+        self.filename_or_url.contains("$W$")
+            || self
+                .parameters
+                .as_ref()
+                .is_some_and(|p| p.contains("$W$"))
+    }
+
     /// Execute this magic word with the given user arguments (text after the keyword).
     pub fn execute(&self, user_args: &str) {
         // @copy@ — copy resolved params to clipboard

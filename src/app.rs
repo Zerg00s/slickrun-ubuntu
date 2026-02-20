@@ -27,6 +27,8 @@ pub struct LauncherApp {
     x11_window_id: Arc<AtomicU32>,
     x11_search_attempts: u32,
     dragging: bool,
+    pending_w_magic_word: Option<commands::MagicWord>,
+    w_dialog_input: String,
     shared_pos_x: Arc<AtomicU32>,
     shared_pos_y: Arc<AtomicU32>,
     last_known_pos: Option<(f32, f32)>,
@@ -604,6 +606,8 @@ impl LauncherApp {
             x11_window_id,
             x11_search_attempts: 0,
             dragging: false,
+            pending_w_magic_word: None,
+            w_dialog_input: String::new(),
             shared_pos_x,
             shared_pos_y,
             last_known_pos: None,
@@ -808,6 +812,13 @@ impl LauncherApp {
         }
 
         if let Some(mw) = commands::find_by_keyword(&self.settings.magic_words, first_word) {
+            if user_args.is_empty() && mw.needs_w_input() {
+                // $W$ magic word with no args — show input dialog
+                self.pending_w_magic_word = Some(mw.clone());
+                self.w_dialog_input.clear();
+                self.command_input.clear();
+                return;
+            }
             mw.execute(user_args);
             self.command_input.clear();
             self.hide(ctx);
@@ -924,8 +935,8 @@ impl eframe::App for LauncherApp {
             self.was_focused = true; // skip the transition check below
         }
 
-        // Auto-hide on focus loss (suppressed while dragging)
-        if self.settings.hide_on_inactive && self.is_visible.load(Ordering::SeqCst) && !self.settings_window.open && !self.dragging {
+        // Auto-hide on focus loss (suppressed while dragging or $W$ dialog open)
+        if self.settings.hide_on_inactive && self.is_visible.load(Ordering::SeqCst) && !self.settings_window.open && !self.dragging && self.pending_w_magic_word.is_none() {
             if self.was_focused && !focused {
                 eprintln!("[SlickRun] Focus lost — auto-hiding");
                 self.hide(ctx);
@@ -966,14 +977,83 @@ impl eframe::App for LauncherApp {
                 )));
             }
 
-            // Drag support in settings mode — click on title bar area to drag
+            // Drag support in settings mode — only the very top edge (above tab bar)
             if ctx.input(|i| i.pointer.primary_pressed()) {
                 if let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) {
-                    // Allow dragging from the top 30px (title bar area)
-                    if pos.y < 30.0 {
+                    if pos.y < 4.0 {
                         ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                     }
                 }
+            }
+
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            return;
+        }
+
+        // $W$ parameter input dialog
+        if self.pending_w_magic_word.is_some() {
+            // Expand window to fit the label + input (scales with font size)
+            let w_dialog_height = 12.0 + 14.0 + 6.0 + self.settings.font_size + 16.0 + 12.0 + 20.0;
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(
+                self.settings.window_width,
+                w_dialog_height,
+            )));
+
+            let w_enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+            let w_escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+
+            ctx.set_visuals(egui::Visuals::dark());
+
+            let keyword = self
+                .pending_w_magic_word
+                .as_ref()
+                .map(|mw| mw.keyword.clone())
+                .unwrap_or_default();
+
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgb(40, 40, 40))
+                        .inner_margin(12.0),
+                )
+                .show(ctx, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{} — enter parameters:", keyword))
+                            .color(egui::Color32::from_rgb(200, 200, 200))
+                            .size(14.0),
+                    );
+                    ui.add_space(6.0);
+
+                    let w_input_id = egui::Id::new("w_dialog_input");
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.w_dialog_input)
+                            .id(w_input_id)
+                            .font(egui::FontId::monospace(self.settings.font_size))
+                            .desired_width(f32::INFINITY)
+                            .hint_text("Type or paste text, then press Enter"),
+                    );
+                    response.request_focus();
+                });
+
+            if w_enter && !self.w_dialog_input.is_empty() {
+                let mw = self.pending_w_magic_word.take().unwrap();
+                let args = self.w_dialog_input.clone();
+                self.w_dialog_input.clear();
+                // Restore original window size before hiding
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(
+                    self.settings.window_width,
+                    self.settings.window_height,
+                )));
+                mw.execute(&args);
+                self.hide(ctx);
+            } else if w_escape {
+                self.pending_w_magic_word = None;
+                self.w_dialog_input.clear();
+                // Restore original window size
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(
+                    self.settings.window_width,
+                    self.settings.window_height,
+                )));
             }
 
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
