@@ -29,6 +29,9 @@ pub struct LauncherApp {
     dragging: bool,
     shared_pos_x: Arc<AtomicU32>,
     shared_pos_y: Arc<AtomicU32>,
+    last_known_pos: Option<(f32, f32)>,
+    last_pos_query: std::time::Instant,
+    needs_initial_move: bool,
 }
 
 fn toggle_pipe_path() -> std::path::PathBuf {
@@ -178,6 +181,47 @@ fn activate_x11_window_by_id_inner(window_id: u32) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+/// Query Mutter for the SlickRun window position via the GNOME Shell extension.
+fn get_mutter_window_position() -> Option<(i32, i32)> {
+    let output = std::process::Command::new("gdbus")
+        .args([
+            "call", "--session",
+            "--dest", "org.gnome.Shell",
+            "--object-path", "/com/slickrun/Toggle",
+            "--method", "com.slickrun.Toggle.GetPosition",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // Output format: "(x, y)\n"
+    let s = String::from_utf8_lossy(&output.stdout);
+    let s = s.trim().trim_start_matches('(').trim_end_matches(')');
+    let mut parts = s.split(',');
+    let x: i32 = parts.next()?.trim().parse().ok()?;
+    let y: i32 = parts.next()?.trim().parse().ok()?;
+    if x >= 0 && y >= 0 { Some((x, y)) } else { None }
+}
+
+/// Move the SlickRun window via the GNOME Shell extension (Mutter level).
+/// This is the only way to position a window on GNOME Wayland.
+fn move_window_via_mutter(x: i32, y: i32) {
+    let _ = std::process::Command::new("gdbus")
+        .args([
+            "call", "--session",
+            "--dest", "org.gnome.Shell",
+            "--object-path", "/com/slickrun/Toggle",
+            "--method", "com.slickrun.Toggle.MoveWindow",
+            &x.to_string(),
+            &y.to_string(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    eprintln!("[SlickRun] Moving window via Mutter to ({}, {})", x, y);
+}
+
 /// Set _NET_WM_STATE_ABOVE on an X11 window for always-on-top.
 fn set_x11_always_on_top(window_id: u32, enable: bool) {
     if let Err(e) = set_x11_always_on_top_inner(window_id, enable) {
@@ -252,36 +296,54 @@ fn install_gnome_shell_extension() {
     "name": "SlickRun Toggle",
     "description": "Activate SlickRun launcher window via D-Bus",
     "shell-version": ["45", "46", "47", "48"],
-    "version": 2
+    "version": 4
 }"#;
 
-    // The extension only exposes an Activate method.
-    // It finds the SlickRun window and calls meta_window.activate()
-    // which is the proper Mutter-level focus mechanism.
-    // The app handles visibility (show/hide) via off-screen positioning.
     let extension_js = r#"import Gio from 'gi://Gio';
 
-const ActivateIface = `<node>
+const SlickRunIface = `<node>
   <interface name="com.slickrun.Toggle">
     <method name="Activate"/>
+    <method name="GetPosition">
+      <arg type="i" direction="out" name="x"/>
+      <arg type="i" direction="out" name="y"/>
+    </method>
+    <method name="MoveWindow">
+      <arg type="i" direction="in" name="x"/>
+      <arg type="i" direction="in" name="y"/>
+    </method>
   </interface>
 </node>`;
 
 export default class SlickRunToggleExtension {
+    _findWindow() {
+        const actor = global.get_window_actors().find(a => {
+            const m = a.meta_window;
+            return m && m.get_title() === 'SlickRun';
+        });
+        return actor ? actor.meta_window : null;
+    }
+
     enable() {
         this._impl = {
             Activate: () => {
-                const actor = global.get_window_actors().find(a => {
-                    const m = a.meta_window;
-                    return m && m.get_title() === 'SlickRun';
-                });
-                if (actor) {
-                    const win = actor.meta_window;
-                    win.activate(global.get_current_time());
+                const win = this._findWindow();
+                if (win) win.activate(global.get_current_time());
+            },
+            GetPosition: () => {
+                const win = this._findWindow();
+                if (win) {
+                    const rect = win.get_frame_rect();
+                    return [rect.x, rect.y];
                 }
+                return [-1, -1];
+            },
+            MoveWindow: (x, y) => {
+                const win = this._findWindow();
+                if (win) win.move_frame(true, x, y);
             }
         };
-        this._dbus = Gio.DBusExportedObject.wrapJSObject(ActivateIface, this._impl);
+        this._dbus = Gio.DBusExportedObject.wrapJSObject(SlickRunIface, this._impl);
         this._dbus.export(Gio.DBus.session, '/com/slickrun/Toggle');
     }
 
@@ -459,6 +521,7 @@ impl LauncherApp {
         register_gnome_shortcut(&settings.hotkey);
 
         // FIFO pipe for toggle
+        let needs_initial_move = settings.window_x.is_some() && settings.window_y.is_some();
         let toggle_signal = Arc::new(AtomicBool::new(false));
         let is_visible = Arc::new(AtomicBool::new(true));
         let x11_window_id = Arc::new(AtomicU32::new(0));
@@ -534,7 +597,7 @@ impl LauncherApp {
             text_edit_rect: None,
             settings,
             settings_window,
-            was_focused: true,
+            was_focused: false,
             _tray: tray,
             toggle_signal,
             tray_action,
@@ -543,6 +606,9 @@ impl LauncherApp {
             dragging: false,
             shared_pos_x,
             shared_pos_y,
+            last_known_pos: None,
+            last_pos_query: std::time::Instant::now(),
+            needs_initial_move,
         }
     }
 
@@ -554,13 +620,20 @@ impl LauncherApp {
         }
     }
 
-    fn save_position(&mut self, ctx: &egui::Context) {
-        if let Some(pos) = ctx.input(|i| i.viewport().outer_rect).map(|r| r.min) {
-            self.settings.window_x = Some(pos.x);
-            self.settings.window_y = Some(pos.y);
-            self.shared_pos_x.store(pos.x.to_bits(), Ordering::SeqCst);
-            self.shared_pos_y.store(pos.y.to_bits(), Ordering::SeqCst);
+    fn save_position(&mut self, _ctx: &egui::Context) {
+        // Try cached position first, fall back to querying Mutter directly
+        let pos = self.last_known_pos.or_else(|| {
+            get_mutter_window_position().map(|(x, y)| (x as f32, y as f32))
+        });
+        if let Some((x, y)) = pos {
+            eprintln!("[SlickRun] Saving position: ({}, {})", x, y);
+            self.settings.window_x = Some(x);
+            self.settings.window_y = Some(y);
+            self.shared_pos_x.store(x.to_bits(), Ordering::SeqCst);
+            self.shared_pos_y.store(y.to_bits(), Ordering::SeqCst);
             self.settings.save();
+        } else {
+            eprintln!("[SlickRun] save_position: no known position yet");
         }
     }
 
@@ -600,6 +673,9 @@ impl LauncherApp {
         };
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+
+        // Move via Mutter (OuterPosition doesn't work on Wayland)
+        move_window_via_mutter(pos.x as i32, pos.y as i32);
 
         // Re-assert always-on-top after moving back on-screen
         if self.settings.stay_on_top {
@@ -762,11 +838,18 @@ impl eframe::App for LauncherApp {
             }
         }
 
-        // Keep shared position up to date for tray quit handler
+        // Track window position via Mutter (only way to get real position on XWayland).
+        // Query every ~1 second while visible to avoid spawning gdbus too often.
         if self.is_visible.load(Ordering::SeqCst) {
-            if let Some(pos) = ctx.input(|i| i.viewport().outer_rect).map(|r| r.min) {
-                self.shared_pos_x.store(pos.x.to_bits(), Ordering::SeqCst);
-                self.shared_pos_y.store(pos.y.to_bits(), Ordering::SeqCst);
+            let should_query = self.last_known_pos.is_none()
+                || self.last_pos_query.elapsed() > std::time::Duration::from_secs(1);
+            if should_query {
+                self.last_pos_query = std::time::Instant::now();
+                if let Some((x, y)) = get_mutter_window_position() {
+                    self.last_known_pos = Some((x as f32, y as f32));
+                    self.shared_pos_x.store((x as f32).to_bits(), Ordering::SeqCst);
+                    self.shared_pos_y.store((y as f32).to_bits(), Ordering::SeqCst);
+                }
             }
         }
 
@@ -812,6 +895,25 @@ impl eframe::App for LauncherApp {
 
         // Always track focus state so transitions are detected correctly
         let focused = ctx.input(|i| i.focused);
+
+        // On first focus, move window to saved position via Mutter (blocking).
+        // Must wait until window has focus — move_frame doesn't work on unfocused windows.
+        if self.needs_initial_move && focused {
+            self.needs_initial_move = false;
+            if let (Some(x), Some(y)) = (self.settings.window_x, self.settings.window_y) {
+                eprintln!("[SlickRun] Initial move to saved position ({}, {})", x, y);
+                let _ = std::process::Command::new("gdbus")
+                    .args([
+                        "call", "--session",
+                        "--dest", "org.gnome.Shell",
+                        "--object-path", "/com/slickrun/Toggle",
+                        "--method", "com.slickrun.Toggle.MoveWindow",
+                        &(x as i32).to_string(),
+                        &(y as i32).to_string(),
+                    ])
+                    .output(); // blocking — wait for move to complete
+            }
+        }
 
         // Drag end detection: focus returns after being lost while dragging.
         // When drag ends, re-request focus so auto-hide doesn't fire immediately.
