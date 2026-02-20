@@ -1,4 +1,4 @@
-# SlickRun
+# SlickRun for Ubuntu
 
 A fast command launcher for Linux (GNOME/Wayland), inspired by [SlickRun for Windows](https://bayden.com/slickrun/).
 
