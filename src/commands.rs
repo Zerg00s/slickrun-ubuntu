@@ -97,6 +97,14 @@ impl MagicWord {
             return;
         }
 
+        // Directory — open in file manager
+        if std::path::Path::new(&filename).is_dir() {
+            let _ = std::process::Command::new("xdg-open")
+                .arg(&filename)
+                .spawn();
+            return;
+        }
+
         // Regular command
         let full_command = if params.is_empty() {
             filename.clone()
