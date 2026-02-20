@@ -2,6 +2,8 @@
 
 A fast command launcher for Linux (GNOME/Wayland), inspired by [SlickRun for Windows](https://bayden.com/slickrun/).
 
+![alt text](image.png)
+
 Type a keyword, hit Enter, and it runs. That's it.
 
 ![Rust](https://img.shields.io/badge/Rust-1.85+-orange) ![Linux](https://img.shields.io/badge/Platform-Linux-blue) ![License](https://img.shields.io/badge/License-MIT-green)
